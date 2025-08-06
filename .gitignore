@@ -1,0 +1,9 @@
+# Node modules folder
+node_modules
+
+# Environment variables file (contains secret keys)
+.env
+
+# Database file
+quiz.db
+database.js
