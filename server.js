@@ -1,4 +1,3 @@
-// (All the imports and setup are the same)
 require('dotenv').config();
 const express = require("express");
 const cors = require("cors");
@@ -19,14 +18,59 @@ const pool = new Pool({
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// (Login, Register, and Middleware are the same)
-// ...
+// --- AUTHENTICATION ROUTES ---
+app.post("/register", async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const existingUser = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        if (existingUser.rows.length > 0) {
+            return res.status(400).json({ error: "Username already exists." });
+        }
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = await pool.query('INSERT INTO users (username, password) VALUES ($1, $2) RETURNING id', [username, hashedPassword]);
+        res.status(201).json({ message: "User registered successfully!", userId: newUser.rows[0].id });
+    } catch (err) {
+        res.status(500).json({ error: "Server error during registration." });
+    }
+});
 
-// =================================================================
-// ADMIN ROUTES
-// =================================================================
+app.post("/login", async (req, res) => {
+    try {
+        const { username, password } = req.body;
+        const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
+        if (!user || !(await bcrypt.compare(password, user.password))) {
+            return res.status(400).json({ error: "Invalid username or password." });
+        }
+        const isAdmin = user.username === process.env.ADMIN_USERNAME;
+        const token = jwt.sign({ userId: user.id, username: user.username, isAdmin: isAdmin }, JWT_SECRET, { expiresIn: '1h' });
+        res.json({ message: "Login successful!", token });
+    } catch (err) {
+        res.status(500).json({ error: "Server error during login." });
+    }
+});
 
-// This route just gets the list of users. We'll keep it for now.
+// --- MIDDLEWARE ---
+const verifyToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: "Access denied. No token provided." });
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: "Invalid token." });
+        req.user = user;
+        next();
+    });
+};
+
+const verifyAdmin = (req, res, next) => {
+    if (req.user && req.user.isAdmin) {
+        next();
+    } else {
+        res.status(403).json({ error: "Forbidden. Admin access required." });
+    }
+};
+
+// --- ADMIN ROUTES ---
 app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const result = await pool.query('SELECT id, username FROM users ORDER BY id');
@@ -36,34 +80,72 @@ app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
     }
 });
 
-// --- NEW: Route to get all users AND all their scores ---
 app.get("/admin/full-data", verifyToken, verifyAdmin, async (req, res) => {
     try {
-        // We use a more advanced SQL query with a JOIN to combine data from two tables.
-        // This query selects all scores and includes the username for each score's owner.
         const query = `
-            SELECT 
-                s.id, 
-                s.topic, 
-                s.score, 
-                s.total, 
-                s.date, 
-                u.username 
-            FROM scores s
-            JOIN users u ON s.user_id = u.id
+            SELECT s.id, s.topic, s.score, s.total, s.date, u.username 
+            FROM scores s JOIN users u ON s.user_id = u.id
             ORDER BY u.username, s.date DESC;
         `;
         const result = await pool.query(query);
-        res.json(result.rows); // Send the combined data
+        res.json(result.rows);
     } catch (err) {
-        console.error("Get Full Admin Data Error:", err.message);
         res.status(500).json({ error: "Server error while fetching full admin data." });
     }
 });
 
+// --- STANDARD APPLICATION ROUTES ---
+app.post("/save-score", verifyToken, async (req, res) => {
+    try {
+        const { topic, score, total } = req.body;
+        const { userId } = req.user;
+        await pool.query('INSERT INTO scores (user_id, topic, score, total, date) VALUES ($1, $2, $3, $4, $5)', [userId, topic, score, total, new Date().toISOString()]);
+        res.status(201).json({ message: "Score saved successfully!" });
+    } catch (err) { res.status(500).json({ error: "Server error while saving score." }); }
+});
 
-// (The rest of your server.js file is the same)
-// ...
+app.get("/my-scores", verifyToken, async (req, res) => {
+    try {
+        const { userId } = req.user;
+        const result = await pool.query('SELECT topic, score, total, date FROM scores WHERE user_id = $1', [userId]);
+        res.json(result.rows);
+    } catch (err) { res.status(500).json({ error: "Server error while fetching scores." }); }
+});
+
+app.post("/generate-quiz", verifyToken, async (req, res) => {
+    const { topic, level, questionCount = 5 } = req.body;
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+        const prompt = `Generate ${questionCount} multiple choice questions on the topic "${topic}" at a "${level}" difficulty level. The response MUST be a valid JSON array of objects. Do not include any text outside of the JSON array. Each object must have "question", "options" (an array of 4 strings), and "answer" properties.`;
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+        const cleanedText = text.replace(/^```json\s*|```\s*$/g, '');
+        const questions = JSON.parse(cleanedText);
+        res.json({ questions });
+    } catch (err) { res.status(500).json({ error: "Failed to generate quiz questions." }); }
+});
+
+app.post("/generate-hint", verifyToken, async (req, res) => {
+    const { question, options } = req.body;
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+        const prompt = `For the following multiple-choice question, provide a short, single-sentence hint that helps the user think about the answer without giving it away. Question: "${question}" Options: ${options.join(", ")} Hint:`;
+        const result = await model.generateContent(prompt);
+        const hint = result.response.text();
+        res.json({ hint });
+    } catch (err) { res.status(500).json({ error: "Failed to generate hint." }); }
+});
+
+app.post("/generate-study-material", verifyToken, async (req, res) => {
+    const { topic } = req.body;
+    try {
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+        const prompt = `Provide a concise, easy-to-understand study guide for the programming topic: "${topic}". The guide should cover the core concepts, key syntax, and a simple code example. Format the response as plain text, using markdown for headings and code blocks.`;
+        const result = await model.generateContent(prompt);
+        const studyMaterial = result.response.text();
+        res.json({ studyMaterial });
+    } catch (err) { res.status(500).json({ error: "Failed to generate study material." }); }
+});
 
 // --- SERVER START ---
 const PORT = process.env.PORT || 5000;
